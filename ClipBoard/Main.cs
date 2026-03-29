@@ -74,6 +74,7 @@ public class P2PFileShareApp
     private string _lastClipboardText = "";
     private string _lastSentClipboardText = "";
     private readonly object _lock = new();
+    private bool _isLinux;
 
     // Windows API imports for clipboard
     [DllImport("user32.dll")]
@@ -117,13 +118,18 @@ public class P2PFileShareApp
             "P2PFileShare");
 
         Directory.CreateDirectory(_shareDirectory);
+        
+        // Detect OS
+        _isLinux = Environment.OSVersion.Platform == PlatformID.Unix || 
+                   Environment.OSVersion.Platform == PlatformID.MacOSX;
     }
 
     public async Task RunAsync()
     {
         Console.WriteLine("╔════════════════════════════════════════╗");
         Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.2                  ║");
+        Console.WriteLine("║           Version 2.3                  ║");
+        Console.WriteLine($"║           OS: {(_isLinux ? "Linux" : "Windows")}                    ║");
         Console.WriteLine("╚════════════════════════════════════════╝");
         Console.WriteLine();
         Console.WriteLine($"Device ID: {_peerId}");
@@ -347,7 +353,7 @@ public class P2PFileShareApp
                 
                 try
                 {
-                    bool success = SetWindowsClipboardText(clipboardData.Text);
+                    bool success = SetClipboardText(clipboardData.Text);
                     if (success)
                     {
                         Console.WriteLine("   ✅ Text copied to system clipboard");
@@ -499,7 +505,7 @@ public class P2PFileShareApp
         Console.WriteLine($"📋 Text sent to shared clipboard: {text.Length} characters");
         
         // Also update local clipboard
-        SetWindowsClipboardText(text);
+        SetClipboardText(text);
         _lastClipboardText = text;
     }
 
@@ -529,7 +535,16 @@ public class P2PFileShareApp
         {
             try
             {
-                var currentText = GetWindowsClipboardText();
+                string currentText = null;
+                
+                if (_isLinux)
+                {
+                    currentText = GetLinuxClipboard();
+                }
+                else
+                {
+                    currentText = GetWindowsClipboardText();
+                }
                 
                 // Check if clipboard changed and we're connected
                 if (!string.IsNullOrEmpty(currentText) && 
@@ -538,13 +553,18 @@ public class P2PFileShareApp
                     currentText != _lastSentClipboardText)
                 {
                     Console.WriteLine($"\n📋 Clipboard changed detected!");
-                    Console.WriteLine($"   New text: {currentText}");
+                    Console.WriteLine($"   New text: {currentText.Substring(0, Math.Min(50, currentText.Length))}...");
                     
                     _lastClipboardText = currentText;
                     
                     // Send to peer
                     await SendClipboardDataAsync(currentText);
                     Console.WriteLine($"   ✅ Text sent to peer");
+                }
+                else if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
+                {
+                    // Just update local tracking without sending
+                    _lastClipboardText = currentText;
                 }
             }
             catch (Exception ex)
@@ -554,6 +574,19 @@ public class P2PFileShareApp
             }
 
             await Task.Delay(500, token); // Check every 500ms for faster response
+        }
+    }
+
+    // Cross-platform clipboard functions
+    private bool SetClipboardText(string text)
+    {
+        if (_isLinux)
+        {
+            return SetLinuxClipboard(text);
+        }
+        else
+        {
+            return SetWindowsClipboardText(text);
         }
     }
 
@@ -646,6 +679,87 @@ public class P2PFileShareApp
         }
     }
 
+    // Linux Clipboard functions with continuous monitoring
+    private string GetLinuxClipboard()
+    {
+        try
+        {
+            // Try primary selection first (mouse selection)
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "xclip",
+                Arguments = "-selection primary -o",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8
+            };
+            
+            using (var process = System.Diagnostics.Process.Start(psi))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit(200);
+                if (!string.IsNullOrEmpty(output))
+                {
+                    return output.Trim();
+                }
+            }
+            
+            // Try clipboard selection (Ctrl+C)
+            psi.Arguments = "-selection clipboard -o";
+            using (var process = System.Diagnostics.Process.Start(psi))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit(200);
+                return output.Trim();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool SetLinuxClipboard(string text)
+    {
+        try
+        {
+            // Set both primary and clipboard selections
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "xclip",
+                Arguments = "-selection clipboard",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                CreateNoWindow = true
+            };
+            
+            using (var process = System.Diagnostics.Process.Start(psi))
+            {
+                process.StandardInput.Write(text);
+                process.StandardInput.Close();
+                process.WaitForExit(1000);
+            }
+            
+            // Also set primary selection for mouse middle-click
+            psi.Arguments = "-selection primary";
+            using (var process = System.Diagnostics.Process.Start(psi))
+            {
+                process.StandardInput.Write(text);
+                process.StandardInput.Close();
+                process.WaitForExit(1000);
+            }
+            
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"   ⚠️ Error setting Linux clipboard: {ex.Message}");
+            Console.WriteLine("   Install xclip: sudo apt-get install xclip");
+            return false;
+        }
+    }
+
     private void ShowFileList()
     {
         Console.WriteLine($"\n📁 Files in {_shareDirectory}:");
@@ -734,6 +848,7 @@ public class P2PFileShareApp
         Console.WriteLine($"│ Server mode: {(_isServerRunning ? "Active" : "Inactive"),-24}│");
         Console.WriteLine($"│ Connected:   {(_isConnected ? "Yes" : "No"),-24}│");
         Console.WriteLine($"│ Directory:   {_shareDirectory,-24}│");
+        Console.WriteLine($"│ OS:          {(_isLinux ? "Linux" : "Windows"),-24}│");
         Console.WriteLine("└─────────────────────────────────────┘");
     }
 
