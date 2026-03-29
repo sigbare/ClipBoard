@@ -52,6 +52,7 @@ public class ClipboardData
 {
     public string Text { get; set; }
     public DateTime Timestamp { get; set; }
+    public string SenderId { get; set; }
 }
 
 public class FileListInfo
@@ -71,6 +72,7 @@ public class P2PFileShareApp
     private bool _isConnected;
     private bool _isServerRunning;
     private string _lastClipboardText = "";
+    private string _lastSentClipboardText = "";
     private readonly object _lock = new();
 
     // Windows API imports for clipboard
@@ -121,7 +123,7 @@ public class P2PFileShareApp
     {
         Console.WriteLine("╔════════════════════════════════════════╗");
         Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.1                  ║");
+        Console.WriteLine("║           Version 2.2                  ║");
         Console.WriteLine("╚════════════════════════════════════════╝");
         Console.WriteLine();
         Console.WriteLine($"Device ID: {_peerId}");
@@ -333,6 +335,13 @@ public class P2PFileShareApp
             case MessageType.ClipboardSync:
                 var clipboardData = JsonSerializer.Deserialize<ClipboardData>(
                     JsonSerializer.Serialize(message.Data));
+                
+                // Don't process if this is our own message
+                if (clipboardData.SenderId == _peerId)
+                {
+                    break;
+                }
+                
                 Console.WriteLine($"📋 Received clipboard text from {message.SenderId}:");
                 Console.WriteLine($"   {clipboardData.Text}");
                 
@@ -342,6 +351,7 @@ public class P2PFileShareApp
                     if (success)
                     {
                         Console.WriteLine("   ✅ Text copied to system clipboard");
+                        // Update last clipboard text to prevent echo
                         _lastClipboardText = clipboardData.Text;
                     }
                     else
@@ -485,10 +495,21 @@ public class P2PFileShareApp
             return;
         }
 
+        await SendClipboardDataAsync(text);
+        Console.WriteLine($"📋 Text sent to shared clipboard: {text.Length} characters");
+        
+        // Also update local clipboard
+        SetWindowsClipboardText(text);
+        _lastClipboardText = text;
+    }
+
+    private async Task SendClipboardDataAsync(string text)
+    {
         var clipboardData = new ClipboardData
         {
             Text = text,
-            Timestamp = DateTime.Now
+            Timestamp = DateTime.Now,
+            SenderId = _peerId
         };
 
         var message = new NetworkMessage
@@ -499,10 +520,7 @@ public class P2PFileShareApp
         };
 
         await SendMessageAsync(message);
-        Console.WriteLine($"📋 Text sent to shared clipboard: {text.Length} characters");
-        
-        // Also update local clipboard
-        SetWindowsClipboardText(text);
+        _lastSentClipboardText = text;
     }
 
     private async Task MonitorClipboardAsync(CancellationToken token)
@@ -512,31 +530,21 @@ public class P2PFileShareApp
             try
             {
                 var currentText = GetWindowsClipboardText();
-
-                if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
+                
+                // Check if clipboard changed and we're connected
+                if (!string.IsNullOrEmpty(currentText) && 
+                    currentText != _lastClipboardText && 
+                    _isConnected &&
+                    currentText != _lastSentClipboardText)
                 {
+                    Console.WriteLine($"\n📋 Clipboard changed detected!");
+                    Console.WriteLine($"   New text: {currentText}");
+                    
                     _lastClipboardText = currentText;
-
-                    if (_isConnected)
-                    {
-                        Console.WriteLine($"\n📋 Clipboard changed, sending...");
-                        Console.WriteLine($"   Text: {currentText}");
-                        
-                        var clipboardData = new ClipboardData
-                        {
-                            Text = currentText,
-                            Timestamp = DateTime.Now
-                        };
-
-                        var message = new NetworkMessage
-                        {
-                            Type = MessageType.ClipboardSync,
-                            SenderId = _peerId,
-                            Data = clipboardData
-                        };
-
-                        await SendMessageAsync(message);
-                    }
+                    
+                    // Send to peer
+                    await SendClipboardDataAsync(currentText);
+                    Console.WriteLine($"   ✅ Text sent to peer");
                 }
             }
             catch (Exception ex)
@@ -545,7 +553,7 @@ public class P2PFileShareApp
                     Console.WriteLine($"⚠️ Clipboard monitoring error: {ex.Message}");
             }
 
-            await Task.Delay(1000, token);
+            await Task.Delay(500, token); // Check every 500ms for faster response
         }
     }
 
