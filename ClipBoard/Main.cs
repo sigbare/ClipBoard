@@ -75,9 +75,8 @@ public class P2PFileShareApp
     private string _lastSentClipboardText = "";
     private readonly object _lock = new();
     private bool _isLinux;
-    private string _lastClipboardCheck = "";
 
-    // Windows API imports for clipboard
+    // Windows API imports for clipboard with Unicode support
     [DllImport("user32.dll")]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
 
@@ -108,7 +107,11 @@ public class P2PFileShareApp
     [DllImport("kernel32.dll")]
     private static extern IntPtr GlobalFree(IntPtr hMem);
 
+    [DllImport("user32.dll")]
+    private static extern int GetClipboardSequenceNumber();
+
     private const uint CF_TEXT = 1;
+    private const uint CF_UNICODETEXT = 13;
     private const uint GMEM_MOVEABLE = 0x0002;
 
     public P2PFileShareApp()
@@ -127,9 +130,12 @@ public class P2PFileShareApp
 
     public async Task RunAsync()
     {
+        Console.OutputEncoding = Encoding.UTF8;
+        Console.InputEncoding = Encoding.UTF8;
+        
         Console.WriteLine("╔════════════════════════════════════════╗");
         Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.4                  ║");
+        Console.WriteLine("║           Version 2.5                  ║");
         Console.WriteLine($"║           OS: {(_isLinux ? "Linux" : "Windows")}                    ║");
         Console.WriteLine("╚════════════════════════════════════════╝");
         Console.WriteLine();
@@ -536,41 +542,60 @@ public class P2PFileShareApp
 
     private async Task MonitorClipboardAsync(CancellationToken token)
     {
+        int lastSequenceNumber = 0;
+        
         while (!token.IsCancellationRequested)
         {
             try
             {
-                string currentText = null;
-                
-                if (_isLinux)
+                if (!_isLinux)
                 {
-                    // On Linux, only check the clipboard (Ctrl+C), not primary selection
-                    currentText = GetLinuxClipboardOnly();
+                    // On Windows, use sequence number for efficient monitoring
+                    int currentSequence = GetClipboardSequenceNumber();
+                    if (currentSequence != lastSequenceNumber)
+                    {
+                        lastSequenceNumber = currentSequence;
+                        string currentText = GetWindowsClipboardText();
+                        
+                        if (!string.IsNullOrEmpty(currentText) && 
+                            currentText != _lastClipboardText && 
+                            _isConnected &&
+                            currentText != _lastSentClipboardText)
+                        {
+                            Console.WriteLine($"\n📋 Clipboard changed detected!");
+                            Console.WriteLine($"   New text: {currentText.Substring(0, Math.Min(50, currentText.Length))}...");
+                            
+                            _lastClipboardText = currentText;
+                            await SendClipboardDataAsync(currentText);
+                            Console.WriteLine($"   ✅ Text sent to peer");
+                        }
+                        else if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
+                        {
+                            _lastClipboardText = currentText;
+                        }
+                    }
                 }
                 else
                 {
-                    currentText = GetWindowsClipboardText();
-                }
-                
-                // Check if clipboard changed and we're connected
-                if (!string.IsNullOrEmpty(currentText) && 
-                    currentText != _lastClipboardText && 
-                    _isConnected &&
-                    currentText != _lastSentClipboardText)
-                {
-                    Console.WriteLine($"\n📋 Clipboard changed detected!");
-                    Console.WriteLine($"   New text: {currentText.Substring(0, Math.Min(50, currentText.Length))}...");
+                    // Linux: check clipboard
+                    string currentText = GetLinuxClipboardOnly();
                     
-                    _lastClipboardText = currentText;
-                    
-                    // Send to peer
-                    await SendClipboardDataAsync(currentText);
-                    Console.WriteLine($"   ✅ Text sent to peer");
-                }
-                else if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
-                {
-                    // Just update local tracking without sending
-                    _lastClipboardText = currentText;
+                    if (!string.IsNullOrEmpty(currentText) && 
+                        currentText != _lastClipboardText && 
+                        _isConnected &&
+                        currentText != _lastSentClipboardText)
+                    {
+                        Console.WriteLine($"\n📋 Clipboard changed detected!");
+                        Console.WriteLine($"   New text: {currentText.Substring(0, Math.Min(50, currentText.Length))}...");
+                        
+                        _lastClipboardText = currentText;
+                        await SendClipboardDataAsync(currentText);
+                        Console.WriteLine($"   ✅ Text sent to peer");
+                    }
+                    else if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
+                    {
+                        _lastClipboardText = currentText;
+                    }
                 }
             }
             catch (Exception ex)
@@ -579,7 +604,7 @@ public class P2PFileShareApp
                     Console.WriteLine($"⚠️ Clipboard monitoring error: {ex.Message}");
             }
 
-            await Task.Delay(500, token); // Check every 500ms for faster response
+            await Task.Delay(500, token);
         }
     }
 
@@ -592,11 +617,11 @@ public class P2PFileShareApp
         }
         else
         {
-            return SetWindowsClipboardText(text);
+            return SetWindowsClipboardTextUnicode(text);
         }
     }
 
-    // Windows Clipboard functions
+    // Windows Clipboard functions with Unicode support
     private string GetWindowsClipboardText()
     {
         try
@@ -606,26 +631,51 @@ public class P2PFileShareApp
 
             try
             {
-                if (!IsClipboardFormatAvailable(CF_TEXT))
-                    return null;
-
-                IntPtr handle = GetClipboardData(CF_TEXT);
-                if (handle == IntPtr.Zero)
-                    return null;
-
-                IntPtr pointer = GlobalLock(handle);
-                if (pointer == IntPtr.Zero)
-                    return null;
-
-                try
+                // Try Unicode first
+                if (IsClipboardFormatAvailable(CF_UNICODETEXT))
                 {
-                    string text = Marshal.PtrToStringAnsi(pointer);
-                    return text;
+                    IntPtr handle = GetClipboardData(CF_UNICODETEXT);
+                    if (handle != IntPtr.Zero)
+                    {
+                        IntPtr pointer = GlobalLock(handle);
+                        if (pointer != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                string text = Marshal.PtrToStringUni(pointer);
+                                return text;
+                            }
+                            finally
+                            {
+                                GlobalUnlock(handle);
+                            }
+                        }
+                    }
                 }
-                finally
+                
+                // Fallback to ANSI if Unicode not available
+                if (IsClipboardFormatAvailable(CF_TEXT))
                 {
-                    GlobalUnlock(handle);
+                    IntPtr handle = GetClipboardData(CF_TEXT);
+                    if (handle != IntPtr.Zero)
+                    {
+                        IntPtr pointer = GlobalLock(handle);
+                        if (pointer != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                string text = Marshal.PtrToStringAnsi(pointer);
+                                return text;
+                            }
+                            finally
+                            {
+                                GlobalUnlock(handle);
+                            }
+                        }
+                    }
                 }
+                
+                return null;
             }
             finally
             {
@@ -638,7 +688,7 @@ public class P2PFileShareApp
         }
     }
 
-    private bool SetWindowsClipboardText(string text)
+    private bool SetWindowsClipboardTextUnicode(string text)
     {
         try
         {
@@ -649,7 +699,8 @@ public class P2PFileShareApp
             {
                 EmptyClipboard();
                 
-                byte[] bytes = Encoding.ASCII.GetBytes(text + "\0");
+                // Use Unicode format
+                byte[] bytes = Encoding.Unicode.GetBytes(text + "\0");
                 IntPtr handle = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
                 
                 if (handle == IntPtr.Zero)
@@ -671,7 +722,7 @@ public class P2PFileShareApp
                     GlobalUnlock(handle);
                 }
 
-                SetClipboardData(CF_TEXT, handle);
+                SetClipboardData(CF_UNICODETEXT, handle);
                 return true;
             }
             finally
@@ -685,12 +736,11 @@ public class P2PFileShareApp
         }
     }
 
-    // Linux Clipboard functions - ONLY for clipboard (Ctrl+C), not primary selection
+    // Linux Clipboard functions with UTF-8 support
     private string GetLinuxClipboardOnly()
     {
         try
         {
-            // Check ONLY the clipboard selection (Ctrl+C), not primary selection
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "xclip",
@@ -706,7 +756,6 @@ public class P2PFileShareApp
                 string output = process.StandardOutput.ReadToEnd();
                 process.WaitForExit(200);
                 
-                // Only return if we got actual text
                 if (!string.IsNullOrEmpty(output))
                 {
                     return output.Trim();
@@ -725,7 +774,6 @@ public class P2PFileShareApp
     {
         try
         {
-            // Set ONLY clipboard selection (Ctrl+V), not primary selection
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "xclip",
@@ -737,7 +785,9 @@ public class P2PFileShareApp
             
             using (var process = System.Diagnostics.Process.Start(psi))
             {
-                process.StandardInput.Write(text);
+                // Write UTF-8 encoded text
+                byte[] bytes = Encoding.UTF8.GetBytes(text);
+                process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
                 process.StandardInput.Close();
                 process.WaitForExit(1000);
             }
