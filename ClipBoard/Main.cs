@@ -75,6 +75,7 @@ public class P2PFileShareApp
     private string _lastSentClipboardText = "";
     private readonly object _lock = new();
     private bool _isLinux;
+    private string _lastClipboardCheck = "";
 
     // Windows API imports for clipboard
     [DllImport("user32.dll")]
@@ -128,12 +129,16 @@ public class P2PFileShareApp
     {
         Console.WriteLine("╔════════════════════════════════════════╗");
         Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.3                  ║");
+        Console.WriteLine("║           Version 2.4                  ║");
         Console.WriteLine($"║           OS: {(_isLinux ? "Linux" : "Windows")}                    ║");
         Console.WriteLine("╚════════════════════════════════════════╝");
         Console.WriteLine();
         Console.WriteLine($"Device ID: {_peerId}");
         Console.WriteLine($"Share Directory: {_shareDirectory}");
+        if (_isLinux)
+        {
+            Console.WriteLine("Note: Only Ctrl+C copies are synced (not mouse selection)");
+        }
         Console.WriteLine();
 
         _cts = new CancellationTokenSource();
@@ -539,7 +544,8 @@ public class P2PFileShareApp
                 
                 if (_isLinux)
                 {
-                    currentText = GetLinuxClipboard();
+                    // On Linux, only check the clipboard (Ctrl+C), not primary selection
+                    currentText = GetLinuxClipboardOnly();
                 }
                 else
                 {
@@ -679,16 +685,16 @@ public class P2PFileShareApp
         }
     }
 
-    // Linux Clipboard functions with continuous monitoring
-    private string GetLinuxClipboard()
+    // Linux Clipboard functions - ONLY for clipboard (Ctrl+C), not primary selection
+    private string GetLinuxClipboardOnly()
     {
         try
         {
-            // Try primary selection first (mouse selection)
+            // Check ONLY the clipboard selection (Ctrl+C), not primary selection
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "xclip",
-                Arguments = "-selection primary -o",
+                Arguments = "-selection clipboard -o",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 CreateNoWindow = true,
@@ -699,20 +705,15 @@ public class P2PFileShareApp
             {
                 string output = process.StandardOutput.ReadToEnd();
                 process.WaitForExit(200);
+                
+                // Only return if we got actual text
                 if (!string.IsNullOrEmpty(output))
                 {
                     return output.Trim();
                 }
             }
             
-            // Try clipboard selection (Ctrl+C)
-            psi.Arguments = "-selection clipboard -o";
-            using (var process = System.Diagnostics.Process.Start(psi))
-            {
-                string output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit(200);
-                return output.Trim();
-            }
+            return null;
         }
         catch
         {
@@ -724,7 +725,7 @@ public class P2PFileShareApp
     {
         try
         {
-            // Set both primary and clipboard selections
+            // Set ONLY clipboard selection (Ctrl+V), not primary selection
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "xclip",
@@ -734,15 +735,6 @@ public class P2PFileShareApp
                 CreateNoWindow = true
             };
             
-            using (var process = System.Diagnostics.Process.Start(psi))
-            {
-                process.StandardInput.Write(text);
-                process.StandardInput.Close();
-                process.WaitForExit(1000);
-            }
-            
-            // Also set primary selection for mouse middle-click
-            psi.Arguments = "-selection primary";
             using (var process = System.Diagnostics.Process.Start(psi))
             {
                 process.StandardInput.Write(text);
