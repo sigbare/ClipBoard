@@ -76,7 +76,7 @@ public class P2PFileShareApp
     private readonly object _lock = new();
     private bool _isLinux;
 
-    // Windows API imports for clipboard with Unicode support
+
     [DllImport("user32.dll")]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
 
