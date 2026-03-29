@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 #endregion
 
 namespace ClipBoard;
@@ -72,6 +73,40 @@ public class P2PFileShareApp
     private string _lastClipboardText = "";
     private readonly object _lock = new();
 
+    // Windows API imports for clipboard
+    [DllImport("user32.dll")]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll")]
+    private static extern bool CloseClipboard();
+
+    [DllImport("user32.dll")]
+    private static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsClipboardFormatAvailable(uint format);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GlobalUnlock(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalFree(IntPtr hMem);
+
+    private const uint CF_TEXT = 1;
+    private const uint GMEM_MOVEABLE = 0x0002;
+
     public P2PFileShareApp()
     {
         _peerId = Environment.MachineName;
@@ -86,7 +121,7 @@ public class P2PFileShareApp
     {
         Console.WriteLine("╔════════════════════════════════════════╗");
         Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.0                  ║");
+        Console.WriteLine("║           Version 2.1                  ║");
         Console.WriteLine("╚════════════════════════════════════════╝");
         Console.WriteLine();
         Console.WriteLine($"Device ID: {_peerId}");
@@ -174,7 +209,6 @@ public class P2PFileShareApp
             Console.WriteLine($"✅ Server started on port {port}");
             Console.WriteLine($"   Waiting for connections...");
 
-            // Start accepting connections in background
             _ = Task.Run(() => AcceptClientsAsync(_cts.Token));
         }
         catch (Exception ex)
@@ -192,7 +226,6 @@ public class P2PFileShareApp
                 var client = await _server.AcceptTcpClientAsync();
                 Console.WriteLine($"🔗 Client connected: {client.Client.RemoteEndPoint}");
 
-                // If there's already an active connection, disconnect the old one
                 if (_isConnected)
                 {
                     Console.WriteLine("   Disconnecting previous client...");
@@ -237,10 +270,8 @@ public class P2PFileShareApp
             _isConnected = true;
             Console.WriteLine($"✅ Connected to {ip}:{port}");
 
-            // Start receiving messages
             _ = Task.Run(() => ReceiveMessagesAsync(_cts.Token));
 
-            // Send greeting
             var helloMsg = new NetworkMessage
             {
                 Type = MessageType.Heartbeat,
@@ -261,7 +292,6 @@ public class P2PFileShareApp
         {
             try
             {
-                // Read message length (4 bytes)
                 var lengthBytes = new byte[4];
                 int bytesRead = 0;
                 while (bytesRead < 4)
@@ -272,8 +302,6 @@ public class P2PFileShareApp
                 }
 
                 int messageLength = BitConverter.ToInt32(lengthBytes, 0);
-
-                // Read the message
                 var messageBytes = new byte[messageLength];
                 bytesRead = 0;
                 while (bytesRead < messageLength)
@@ -307,11 +335,19 @@ public class P2PFileShareApp
                     JsonSerializer.Serialize(message.Data));
                 Console.WriteLine($"📋 Received clipboard text from {message.SenderId}:");
                 Console.WriteLine($"   {clipboardData.Text}");
-                // Update system clipboard
+                
                 try
                 {
-                    SetClipboardText(clipboardData.Text);
-                    Console.WriteLine("   ✅ Text copied to system clipboard");
+                    bool success = SetWindowsClipboardText(clipboardData.Text);
+                    if (success)
+                    {
+                        Console.WriteLine("   ✅ Text copied to system clipboard");
+                        _lastClipboardText = clipboardData.Text;
+                    }
+                    else
+                    {
+                        Console.WriteLine("   ⚠️ Failed to copy to system clipboard");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -415,7 +451,6 @@ public class P2PFileShareApp
     {
         var filePath = Path.Combine(_shareDirectory, fileInfo.FileName);
 
-        // If file exists, add suffix
         if (File.Exists(filePath))
         {
             var nameWithoutExt = Path.GetFileNameWithoutExtension(fileInfo.FileName);
@@ -465,6 +500,9 @@ public class P2PFileShareApp
 
         await SendMessageAsync(message);
         Console.WriteLine($"📋 Text sent to shared clipboard: {text.Length} characters");
+        
+        // Also update local clipboard
+        SetWindowsClipboardText(text);
     }
 
     private async Task MonitorClipboardAsync(CancellationToken token)
@@ -473,7 +511,7 @@ public class P2PFileShareApp
         {
             try
             {
-                var currentText = GetClipboardText();
+                var currentText = GetWindowsClipboardText();
 
                 if (!string.IsNullOrEmpty(currentText) && currentText != _lastClipboardText)
                 {
@@ -482,6 +520,8 @@ public class P2PFileShareApp
                     if (_isConnected)
                     {
                         Console.WriteLine($"\n📋 Clipboard changed, sending...");
+                        Console.WriteLine($"   Text: {currentText}");
+                        
                         var clipboardData = new ClipboardData
                         {
                             Text = currentText,
@@ -506,6 +546,95 @@ public class P2PFileShareApp
             }
 
             await Task.Delay(1000, token);
+        }
+    }
+
+    // Windows Clipboard functions
+    private string GetWindowsClipboardText()
+    {
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero))
+                return null;
+
+            try
+            {
+                if (!IsClipboardFormatAvailable(CF_TEXT))
+                    return null;
+
+                IntPtr handle = GetClipboardData(CF_TEXT);
+                if (handle == IntPtr.Zero)
+                    return null;
+
+                IntPtr pointer = GlobalLock(handle);
+                if (pointer == IntPtr.Zero)
+                    return null;
+
+                try
+                {
+                    string text = Marshal.PtrToStringAnsi(pointer);
+                    return text;
+                }
+                finally
+                {
+                    GlobalUnlock(handle);
+                }
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool SetWindowsClipboardText(string text)
+    {
+        try
+        {
+            if (!OpenClipboard(IntPtr.Zero))
+                return false;
+
+            try
+            {
+                EmptyClipboard();
+                
+                byte[] bytes = Encoding.ASCII.GetBytes(text + "\0");
+                IntPtr handle = GlobalAlloc(GMEM_MOVEABLE, (UIntPtr)bytes.Length);
+                
+                if (handle == IntPtr.Zero)
+                    return false;
+
+                IntPtr pointer = GlobalLock(handle);
+                if (pointer == IntPtr.Zero)
+                {
+                    GlobalFree(handle);
+                    return false;
+                }
+
+                try
+                {
+                    Marshal.Copy(bytes, 0, pointer, bytes.Length);
+                }
+                finally
+                {
+                    GlobalUnlock(handle);
+                }
+
+                SetClipboardData(CF_TEXT, handle);
+                return true;
+            }
+            finally
+            {
+                CloseClipboard();
+            }
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -611,106 +740,6 @@ public class P2PFileShareApp
             len = len / 1024;
         }
         return $"{len:0.##} {sizes[order]}";
-    }
-
-    // Cross-platform clipboard handling
-    private string GetClipboardText()
-    {
-        try
-        {
-            if (Environment.OSVersion.Platform == PlatformID.Unix ||
-                Environment.OSVersion.Platform == PlatformID.MacOSX)
-            {
-                return GetLinuxClipboard();
-            }
-            else
-            {
-                return GetWindowsClipboard();
-            }
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private void SetClipboardText(string text)
-    {
-        try
-        {
-            if (Environment.OSVersion.Platform == PlatformID.Unix ||
-                Environment.OSVersion.Platform == PlatformID.MacOSX)
-            {
-                SetLinuxClipboard(text);
-            }
-            else
-            {
-                SetWindowsClipboard(text);
-            }
-        }
-        catch
-        {
-            // Ignore errors
-        }
-    }
-
-    private string GetWindowsClipboard()
-    {
-        // In console application, clipboard access is limited
-        return null;
-    }
-
-    private void SetWindowsClipboard(string text)
-    {
-        Console.WriteLine($"   [Windows] Text copied to clipboard");
-    }
-
-    private string GetLinuxClipboard()
-    {
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "xclip",
-                Arguments = "-selection clipboard -o",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                CreateNoWindow = true
-            };
-
-            var process = System.Diagnostics.Process.Start(psi);
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(1000);
-            return output.Trim();
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private void SetLinuxClipboard(string text)
-    {
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "xclip",
-                Arguments = "-selection clipboard",
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                CreateNoWindow = true
-            };
-
-            var process = System.Diagnostics.Process.Start(psi);
-            process.StandardInput.Write(text);
-            process.StandardInput.Close();
-            process.WaitForExit(1000);
-        }
-        catch
-        {
-            Console.WriteLine("   ⚠️ Install xclip: sudo apt-get install xclip");
-        }
     }
 
     public static async Task Main(string[] args)
