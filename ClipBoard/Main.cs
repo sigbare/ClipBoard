@@ -1,65 +1,18 @@
 ﻿#region Using
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Text.Json;
-using System.Runtime.InteropServices;
+    using System.Net;
+    using System.Net.Sockets;
+    using System.Text;
+    using System.Text.Json;
+    using System.Runtime.InteropServices;
+    using ClipBoard.Models;
+    using ClipBoard.Services;
+    using System.Buffers.Binary;
+    using System.IO.Pipelines;
+    using System.Buffers;
 #endregion
 
 namespace ClipBoard;
 
-public enum MessageType
-{
-    FileTransfer,
-    ClipboardSync,
-    Heartbeat,
-    Disconnect,
-    FileListRequest,
-    FileListResponse
-}
-
-public class NetworkMessage
-{
-    public MessageType Type { get; set; }
-    public string SenderId { get; set; }
-    public DateTime Timestamp { get; set; } = DateTime.Now;
-    public object Data { get; set; }
-
-    private readonly JsonSerializerOptions _jsonSerializerOptions = new() { WriteIndented = false };
-
-    public byte[] Serialize()
-    {
-        var json = JsonSerializer.Serialize(this, _jsonSerializerOptions);
-        return Encoding.UTF8.GetBytes(json);
-    }
-
-    public static NetworkMessage Deserialize(byte[] data)
-    {
-        var json = Encoding.UTF8.GetString(data);
-        return JsonSerializer.Deserialize<NetworkMessage>(json);
-    }
-}
-
-public class FileTransferInfo
-{
-    public string FileName { get; set; }
-    public long FileSize { get; set; }
-    public byte[] FileData { get; set; }
-    public string DestinationPath { get; set; }
-}
-
-public class ClipboardData
-{
-    public string Text { get; set; }
-    public DateTime Timestamp { get; set; }
-    public string SenderId { get; set; }
-}
-
-public class FileListInfo
-{
-    public List<string> Files { get; set; }
-    public string Directory { get; set; }
-}
 
 public class P2PFileShareApp
 {
@@ -67,14 +20,15 @@ public class P2PFileShareApp
     private TcpClient _client;
     private NetworkStream _stream;
     private CancellationTokenSource _cts;
-    private string _shareDirectory;
-    private string _peerId;
+    private readonly string _shareDirectory;
+    private readonly string _peerId;
     private bool _isConnected;
     private bool _isServerRunning;
     private string _lastClipboardText = "";
     private string _lastSentClipboardText = "";
-    private readonly object _lock = new();
-    private bool _isLinux;
+    private readonly Lock _lock = new();
+    private readonly bool _isLinux;
+    private readonly PipeReader _reader;
 
 
     [DllImport("user32.dll")]
@@ -123,33 +77,16 @@ public class P2PFileShareApp
 
         Directory.CreateDirectory(_shareDirectory);
         
-        // Detect OS
         _isLinux = Environment.OSVersion.Platform == PlatformID.Unix || 
                    Environment.OSVersion.Platform == PlatformID.MacOSX;
     }
 
     public async Task RunAsync()
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        Console.InputEncoding = Encoding.UTF8;
-        
-        Console.WriteLine("╔════════════════════════════════════════╗");
-        Console.WriteLine("║     P2P File Share & Clipboard Sync    ║");
-        Console.WriteLine("║           Version 2.5                  ║");
-        Console.WriteLine($"║           OS: {(_isLinux ? "Linux" : "Windows")}                    ║");
-        Console.WriteLine("╚════════════════════════════════════════╝");
-        Console.WriteLine();
-        Console.WriteLine($"Device ID: {_peerId}");
-        Console.WriteLine($"Share Directory: {_shareDirectory}");
-        if (_isLinux)
-        {
-            Console.WriteLine("Note: Only Ctrl+C copies are synced (not mouse selection)");
-        }
-        Console.WriteLine();
+        ConsoleUi.HelloMessage(_isLinux);
 
         _cts = new CancellationTokenSource();
 
-        // Start clipboard monitoring
         _ = Task.Run(() => MonitorClipboardAsync(_cts.Token));
 
         await MainMenuAsync();
@@ -159,21 +96,7 @@ public class P2PFileShareApp
     {
         while (true)
         {
-            Console.WriteLine();
-            Console.WriteLine("┌─────────────────────────────────────┐");
-            Console.WriteLine("│           MAIN MENU                 │");
-            Console.WriteLine("├─────────────────────────────────────┤");
-            Console.WriteLine("│ 1. Start as Server                 │");
-            Console.WriteLine("│ 2. Connect to Server               │");
-            Console.WriteLine("│ 3. Show File List                  │");
-            Console.WriteLine("│ 4. Send File                       │");
-            Console.WriteLine("│ 5. Send Text to Clipboard          │");
-            Console.WriteLine("│ 6. Show Connection Status          │");
-            Console.WriteLine("│ 7. Disconnect                      │");
-            Console.WriteLine("│ 8. Exit                            │");
-            Console.WriteLine("└─────────────────────────────────────┘");
-            Console.Write("Select action: ");
-
+            ConsoleUi.MainMenu();
             var choice = Console.ReadLine();
             switch (choice)
             {
@@ -193,7 +116,7 @@ public class P2PFileShareApp
                     await SendClipboardTextAsync();
                     break;
                 case "6":
-                    ShowStatus();
+                    ConsoleUi.ShowStatus(_peerId,_isServerRunning,_isConnected,_shareDirectory,_isLinux);
                     break;
                 case "7":
                     await DisconnectAsync();
@@ -242,7 +165,7 @@ public class P2PFileShareApp
         {
             try
             {
-                var client = await _server.AcceptTcpClientAsync();
+                var client = await _server.AcceptTcpClientAsync(token);
                 Console.WriteLine($"🔗 Client connected: {client.Client.RemoteEndPoint}");
 
                 if (_isConnected)
@@ -255,7 +178,7 @@ public class P2PFileShareApp
                 _stream = client.GetStream();
                 _isConnected = true;
 
-                _ = Task.Run(() => ReceiveMessagesAsync(token));
+                _ = Task.Run(() => ReceiveMessagesAsync(token), token);
             }
             catch (Exception ex)
             {
@@ -294,7 +217,7 @@ public class P2PFileShareApp
             var helloMsg = new NetworkMessage
             {
                 Type = MessageType.Heartbeat,
-                SenderId = _peerId,
+                SenderId = _peerId + Guid.NewGuid().ToString().Take(4),
                 Data = $"Connected {_peerId}"
             };
             await SendMessageAsync(helloMsg);
@@ -309,40 +232,40 @@ public class P2PFileShareApp
     {
         while (!token.IsCancellationRequested && _isConnected)
         {
+           ReadResult result = await _reader.ReadAsync(token);
+           ReadOnlySequence<byte> buffer = result.Buffer;
+
             try
             {
-                var lengthBytes = new byte[4];
-                int bytesRead = 0;
-                while (bytesRead < 4)
+                while (TryReadMessage(ref buffer, out var message))
                 {
-                    int read = await _stream.ReadAsync(lengthBytes, bytesRead, 4 - bytesRead, token);
-                    if (read == 0) throw new Exception("Connection closed");
-                    bytesRead += read;
+                    if(message != null)
+                        await ProcessMessageAsync(message);
                 }
 
-                int messageLength = BitConverter.ToInt32(lengthBytes, 0);
-                var messageBytes = new byte[messageLength];
-                bytesRead = 0;
-                while (bytesRead < messageLength)
-                {
-                    int read = await _stream.ReadAsync(messageBytes, bytesRead, messageLength - bytesRead, token);
-                    if (read == 0) throw new Exception("Connection closed");
-                    bytesRead += read;
-                }
-
-                var message = NetworkMessage.Deserialize(messageBytes);
-                await ProcessMessageAsync(message);
+                if (result.IsCompleted) break;
             }
-            catch (Exception ex)
+            finally
             {
-                if (!token.IsCancellationRequested)
-                {
-                    Console.WriteLine($"⚠️ Connection lost: {ex.Message}");
-                    _isConnected = false;
-                }
-                break;
+                _reader.AdvanceTo(buffer.Start, buffer.End);
             }
         }
+    }
+
+    private static bool TryReadMessage(ref ReadOnlySequence<byte> buffer, out NetworkMessage? message)
+    {
+        message = null;
+        if (buffer.Length < 4) return false;
+
+        int length = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(0, 4).ToArray());
+
+        if (buffer.Length < 4 + length) return false;
+
+        var payload = buffer.Slice(4, length);
+        message = NetworkMessage.Deserialize(payload);
+
+        buffer = buffer.Slice(buffer.GetPosition(4 + length));
+        return true;
     }
 
     private async Task ProcessMessageAsync(NetworkMessage message)
@@ -881,18 +804,7 @@ public class P2PFileShareApp
         Console.WriteLine("Goodbye!");
     }
 
-    private void ShowStatus()
-    {
-        Console.WriteLine("\n┌─────────────────────────────────────┐");
-        Console.WriteLine("│         CONNECTION STATUS           │");
-        Console.WriteLine("├─────────────────────────────────────┤");
-        Console.WriteLine($"│ Device ID:   {_peerId,-24}│");
-        Console.WriteLine($"│ Server mode: {(_isServerRunning ? "Active" : "Inactive"),-24}│");
-        Console.WriteLine($"│ Connected:   {(_isConnected ? "Yes" : "No"),-24}│");
-        Console.WriteLine($"│ Directory:   {_shareDirectory,-24}│");
-        Console.WriteLine($"│ OS:          {(_isLinux ? "Linux" : "Windows"),-24}│");
-        Console.WriteLine("└─────────────────────────────────────┘");
-    }
+    
 
     private string GetFileSize(long bytes)
     {
