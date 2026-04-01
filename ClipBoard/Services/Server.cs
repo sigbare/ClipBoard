@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Cryptography.X509Certificates;
 using System.Collections.Concurrent;
 using ClipBoard.Models;
 
@@ -71,6 +70,88 @@ public class Server : IDisposable
         }
     }
     
+    public async Task<OperationalResult> StopServerAsync()
+    {
+        if (!IsServerRunning)
+            return OperationalResult.Failure("Server is not running", ErrorType.NotFound);
+        
+        try
+        {
+            _cts.Cancel();
+            
+            var clients = _connectedClients.Values.ToList();
+            foreach (var client in clients)
+            {
+                await DisconnectClientAsync(client);
+            }
+            
+            _server?.Stop();
+            IsServerRunning = false;
+            _portRunning = null;
+            
+            return OperationalResult.Success();
+        }
+        catch (Exception ex)
+        {
+            return OperationalResult.Failure("Error stopping server", ErrorType.Iternal, ex);
+        }
+    }
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+        
+        foreach (var client in _connectedClients.Values)
+        {
+            client.Dispose();
+        }
+        
+        _server?.Stop();
+        GC.SuppressFinalize(this);
+    }
+
+    public async Task<bool> SendToClientAsync(string clientId, byte[] data, 
+        CancellationToken token = default)
+    {
+        if (!_connectedClients.TryGetValue(clientId, out var client))
+            return false;
+        
+        try
+        {
+            if (!client.TcpClient.Connected)
+                return false;
+            
+            var lengthPrefix = BitConverter.GetBytes(data.Length);
+            await client.Stream.WriteAsync(lengthPrefix, 0, lengthPrefix.Length, token);
+            await client.Stream.WriteAsync(data, token);
+            await client.Stream.FlushAsync(token);
+            
+            client.LastActivity = DateTime.UtcNow;
+            return true;
+        }
+        catch
+        {
+            await DisconnectClientAsync(client);
+            return false;
+        }
+    }
+    
+    public async Task BroadcastAsync(byte[] data, string? excludeClientId = null, 
+        CancellationToken token = default)
+    {
+        var tasks = _connectedClients
+            .Where(kvp => kvp.Key != excludeClientId)
+            .Select(kvp => SendToClientAsync(kvp.Key, data, token));
+        
+        await Task.WhenAll(tasks);
+    }
+
+    public async Task<List<string>> GetConnectedClientsAsync()
+        => await Task.Run(() => _connectedClients.Keys.ToList());
+
+    public async Task<ClientConnection?> GetClientInfoAsync(string clientId)
+        => await Task.Run(() => _connectedClients.TryGetValue(clientId, out var client) ? client : null);
+
     private async Task AcceptClientsAsync(CancellationToken token)
     {
         while (!token.IsCancellationRequested && IsServerRunning)
@@ -156,16 +237,12 @@ public class Server : IDisposable
                     
                     var completedTask = await Task.WhenAny(readTask, timeoutTask);
                     if (completedTask == timeoutTask)
-                    {
                         break;
-                    }
                     
                     var bytesRead = await readTask;
                     
                     if (bytesRead == 0)
-                    {
                         break;
-                    }
                     
                     client.LastActivity = DateTime.UtcNow;
                     
@@ -196,53 +273,6 @@ public class Server : IDisposable
         CancellationToken token)
     {
        throw new NotImplementedException();
-    }
-    
-    public async Task<bool> SendToClientAsync(string clientId, byte[] data, 
-        CancellationToken token = default)
-    {
-        if (!_connectedClients.TryGetValue(clientId, out var client))
-            return false;
-        
-        try
-        {
-            if (!client.TcpClient.Connected)
-                return false;
-            
-            var lengthPrefix = BitConverter.GetBytes(data.Length);
-            await client.Stream.WriteAsync(lengthPrefix, 0, lengthPrefix.Length, token);
-            await client.Stream.WriteAsync(data, 0, data.Length, token);
-            await client.Stream.FlushAsync(token);
-            
-            client.LastActivity = DateTime.UtcNow;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            await DisconnectClientAsync(client);
-            return false;
-        }
-    }
-    
-    public async Task BroadcastAsync(byte[] data, string? excludeClientId = null, 
-        CancellationToken token = default)
-    {
-        var tasks = _connectedClients
-            .Where(kvp => kvp.Key != excludeClientId)
-            .Select(kvp => SendToClientAsync(kvp.Key, data, token));
-        
-        await Task.WhenAll(tasks);
-    }
-    
-    public async Task<List<string>> GetConnectedClientsAsync()
-    {
-        return await Task.Run(() => _connectedClients.Keys.ToList());
-    }
-    
-    public async Task<ClientConnection?> GetClientInfoAsync(string clientId)
-    {
-        return await Task.Run(() => 
-            _connectedClients.TryGetValue(clientId, out var client) ? client : null);
     }
     
     private async Task DisconnectClientAsync(ClientConnection client)
@@ -298,46 +328,6 @@ public class Server : IDisposable
         return $"Client_{Interlocked.Increment(ref _connectionCounter)}_{Guid.NewGuid():N}";
     }
     
-    public async Task<OperationalResult> StopServerAsync()
-    {
-        if (!IsServerRunning)
-            return OperationalResult.Failure("Server is not running", ErrorType.NotFound);
-        
-        try
-        {
-            _cts.Cancel();
-            
-            var clients = _connectedClients.Values.ToList();
-            foreach (var client in clients)
-            {
-                await DisconnectClientAsync(client);
-            }
-            
-            _server?.Stop();
-            IsServerRunning = false;
-            _portRunning = null;
-            
-            return OperationalResult.Success();
-        }
-        catch (Exception ex)
-        {
-            return OperationalResult.Failure("Error stopping server", ErrorType.Iternal, ex);
-        }
-    }
-    
-    public void Dispose()
-    {
-        _cts?.Cancel();
-        _cts?.Dispose();
-        
-        foreach (var client in _connectedClients.Values)
-        {
-            client.Dispose();
-        }
-        
-        _server?.Stop();
-        GC.SuppressFinalize(this);
-    }
 }
 
 

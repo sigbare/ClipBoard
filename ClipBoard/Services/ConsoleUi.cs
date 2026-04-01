@@ -1,9 +1,6 @@
-
-
 using System.Text;
 
 namespace ClipBoard.Services;
-
 
 public static class ConsoleUi
 {
