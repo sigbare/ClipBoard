@@ -93,4 +93,3 @@ wheels/
 .installed.cfg
 *.egg
 *.wav
-text.txt
